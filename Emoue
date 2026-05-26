@@ -1,0 +1,769 @@
+# ============================================================
+#  Professional & Academic ML workflow for Sena.xlsx
+#  Models: XGBoost + GBM + RandomForest + CatBoost (optional)
+#  Validation: 70/30 split + 5-fold CV + LOOCV
+#  Outputs: formatted Excel tables + high-res PNG & PDF plots
+# ============================================================
+
+import os, warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import (
+    train_test_split, KFold, GridSearchCV, LeaveOneOut,
+    cross_val_score, cross_val_predict, learning_curve
+)
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.inspection import permutation_importance, PartialDependenceDisplay
+
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+# Optional: XGBoost
+XGB_AVAILABLE = True
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGB_AVAILABLE = False
+    print("⚠️ xgboost non disponible. Installe: pip install xgboost")
+
+# Optional: CatBoost
+CAT_AVAILABLE = True
+try:
+    from catboost import CatBoostRegressor
+except Exception:
+    CAT_AVAILABLE = False
+    print("⚠️ catboost non installé (OK). Si tu veux l’ajouter: pip install catboost")
+
+# Optional: SHAP
+SHAP_AVAILABLE = True
+try:
+    import shap
+except Exception:
+    SHAP_AVAILABLE = False
+    print("⚠️ shap non installé (OK). Si tu veux SHAP: pip install shap")
+
+# Excel formatting
+OPENPYXL_AVAILABLE = True
+try:
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+except Exception:
+    OPENPYXL_AVAILABLE = False
+    print("⚠️ openpyxl non installé. (Tables seront sauvegardées sans formatage).")
+
+# ----------------------------
+# 0) Settings
+# ----------------------------
+RANDOM_STATE = 42
+TEST_SIZE = 0.30
+N_SPLITS = 5
+
+DATA_PATHS = ["/mnt/data/Sena.xlsx", "Sena.xlsx"]
+TARGET = "Yield"
+
+OUTDIR = "outputs_sena"
+FIGDIR = os.path.join(OUTDIR, "figures")
+TABDIR = os.path.join(OUTDIR, "tables")
+os.makedirs(FIGDIR, exist_ok=True)
+os.makedirs(TABDIR, exist_ok=True)
+
+DPI = 450  # High-res for publication
+SAVE_PDF = True
+
+# ----------------------------
+# 1) Global plotting style (professional, clean)
+# ----------------------------
+plt.rcParams.update({
+    "figure.dpi": 160,
+    "savefig.dpi": DPI,
+    "font.size": 12,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "axes.grid": True,
+    "grid.alpha": 0.20,
+    "grid.linestyle": "-",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "legend.frameon": True,
+    "legend.framealpha": 0.95,
+    "legend.fontsize": 11,
+    "lines.linewidth": 2.2,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+})
+
+def _savefig(base_name):
+    """Save both PNG and (optional) PDF with tight layout."""
+    png_path = os.path.join(FIGDIR, f"{base_name}.png")
+    plt.savefig(png_path, bbox_inches="tight")
+    if SAVE_PDF:
+        pdf_path = os.path.join(FIGDIR, f"{base_name}.pdf")
+        plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"[Saved] {png_path}" + (f" + PDF" if SAVE_PDF else ""))
+
+def find_data_path():
+    for p in DATA_PATHS:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("Sena.xlsx introuvable. Mets le fichier dans le dossier courant ou /mnt/data/.")
+
+# ----------------------------
+# 2) Table export (formatted Excel)
+# ----------------------------
+def save_excel_formatted(df_table, filename, float_cols=None, float_digits=4):
+    """
+    Save dataframe to Excel with basic academic formatting.
+    - Header bold + background
+    - Freeze top row
+    - Auto-filter
+    - Column width auto-fit
+    - Numeric formatting
+    """
+    outpath = os.path.join(TABDIR, filename)
+
+    df_out = df_table.copy()
+    if float_cols is not None:
+        for c in float_cols:
+            if c in df_out.columns:
+                df_out[c] = pd.to_numeric(df_out[c], errors="coerce").round(float_digits)
+
+    df_out.to_excel(outpath, index=False)
+
+    if not OPENPYXL_AVAILABLE:
+        return outpath
+
+    wb = openpyxl.load_workbook(outpath)
+    ws = wb.active
+
+    header_fill = PatternFill("solid", fgColor="EAEFF7")
+    header_font = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+    # Auto-filter
+    ws.auto_filter.ref = ws.dimensions
+
+    # Style header
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    # Format cells + alignment
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            if isinstance(cell.value, (int, float, np.floating)):
+                cell.number_format = "0.0000"
+                cell.alignment = center
+            else:
+                cell.alignment = left
+
+    # Auto-fit column widths
+    for col in range(1, ws.max_column + 1):
+        max_len = 0
+        col_letter = get_column_letter(col)
+        for cell in ws[col_letter]:
+            try:
+                max_len = max(max_len, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 40)
+
+    wb.save(outpath)
+    return outpath
+
+# ----------------------------
+# 3) Metrics helper
+# ----------------------------
+def metrics(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = mean_absolute_error(y_true, y_pred)
+    return {"R2": float(r2), "RMSE": rmse, "MSE": float(mse), "MAE": float(mae)}
+
+def _metric_box_text(y_true, y_pred, prefix=""):
+    m = metrics(y_true, y_pred)
+    return (f"{prefix}"
+            f"R² = {m['R2']:.4f}\n"
+            f"RMSE = {m['RMSE']:.4f}\n"
+            f"MAE = {m['MAE']:.4f}")
+
+# ----------------------------
+# 4) Plotting functions (publication-ready)
+# ----------------------------
+def parity_plot_train_test(y_tr, p_tr, y_te, p_te, title, base_name):
+    fig = plt.figure(figsize=(7.0, 6.3))
+    ax = plt.gca()
+
+    # scatter
+    ax.scatter(y_tr, p_tr, s=55, alpha=0.85, edgecolor="white", linewidth=0.6, label="Train")
+    ax.scatter(y_te, p_te, s=70, alpha=0.95, edgecolor="white", linewidth=0.6, marker="s", label="Test")
+
+    # 1:1 line
+    all_y = np.concatenate([np.asarray(y_tr), np.asarray(y_te), np.asarray(p_tr), np.asarray(p_te)])
+    mn, mx = np.min(all_y), np.max(all_y)
+    pad = 0.03 * (mx - mn + 1e-9)
+    lo, hi = mn - pad, mx + pad
+    ax.plot([lo, hi], [lo, hi], linestyle="--")
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Experimental yield (%)")
+    ax.set_ylabel("Predicted yield (%)")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+
+    # metric box (test)
+    txt = _metric_box_text(y_te, p_te, prefix="Test\n")
+    ax.text(
+        0.02, 0.98, txt,
+        transform=ax.transAxes, va="top", ha="left",
+        bbox=dict(boxstyle="round,pad=0.4", alpha=0.12)
+    )
+
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+def residual_plot(y_true, y_pred, title, base_name):
+    res = np.asarray(y_true) - np.asarray(y_pred)
+    fig = plt.figure(figsize=(7.4, 5.4))
+    ax = plt.gca()
+
+    ax.scatter(y_pred, res, s=60, alpha=0.90, edgecolor="white", linewidth=0.6)
+    ax.axhline(0, linestyle="--", linewidth=2)
+    ax.set_xlabel("Predicted yield (%)")
+    ax.set_ylabel("Residuals (Exp − Pred)")
+    ax.set_title(title)
+
+    # tighten y range a bit
+    rmax = np.max(np.abs(res)) + 1e-9
+    ax.set_ylim(-1.15 * rmax, 1.15 * rmax)
+
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+def bar_compare_default_tuned(df_default, df_tuned, metric, title, base_name):
+    """
+    Side-by-side bars for a metric comparing Default vs Tuned for each model.
+    """
+    # Align models ordering by tuned performance
+    order = df_tuned.sort_values(metric, ascending=(metric != "R2"))["Model"].tolist()
+
+    d0 = df_default.set_index("Model").loc[order][metric].values
+    d1 = df_tuned.set_index("Model").loc[order][metric].values
+
+    x = np.arange(len(order))
+    width = 0.38
+
+    fig = plt.figure(figsize=(8.6, 4.9))
+    ax = plt.gca()
+
+    ax.bar(x - width/2, d0, width, label="Default", alpha=0.95)
+    ax.bar(x + width/2, d1, width, label="Tuned", alpha=0.95)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(order, rotation=0)
+    ax.set_ylabel(metric)
+    ax.set_title(title)
+    ax.legend()
+
+    # annotate
+    for i in range(len(order)):
+        ax.text(i - width/2, d0[i], f"{d0[i]:.4f}", ha="center", va="bottom", fontsize=10)
+        ax.text(i + width/2, d1[i], f"{d1[i]:.4f}", ha="center", va="bottom", fontsize=10)
+
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+def loocv_parity_plot(model, X_all, y_all, title, base_name):
+    """
+    LOOCV parity plot using cross_val_predict (cleaner & more academic)
+    """
+    loo = LeaveOneOut()
+    y_cv = cross_val_predict(model, X_all, y_all, cv=loo)
+
+    fig = plt.figure(figsize=(6.8, 6.1))
+    ax = plt.gca()
+
+    ax.scatter(y_all, y_cv, s=55, alpha=0.90, edgecolor="white", linewidth=0.6)
+    mn = min(np.min(y_all), np.min(y_cv))
+    mx = max(np.max(y_all), np.max(y_cv))
+    pad = 0.03 * (mx - mn + 1e-9)
+    lo, hi = mn - pad, mx + pad
+    ax.plot([lo, hi], [lo, hi], linestyle="--")
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Experimental yield (%)")
+    ax.set_ylabel("LOOCV predicted yield (%)")
+    ax.set_title(title)
+
+    ax.text(
+        0.02, 0.98,
+        _metric_box_text(y_all, y_cv, prefix="LOOCV\n"),
+        transform=ax.transAxes, va="top", ha="left",
+        bbox=dict(boxstyle="round,pad=0.4", alpha=0.12)
+    )
+
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+    return y_cv
+
+def loocv_error_distribution(y_true, y_pred, title, base_name):
+    """
+    Distribution of LOOCV errors (boxplot + scatter). Very readable.
+    """
+    err = np.asarray(y_true) - np.asarray(y_pred)
+
+    fig = plt.figure(figsize=(8.2, 4.9))
+    ax = plt.gca()
+
+    # boxplot
+    ax.boxplot(err, vert=False, widths=0.35)
+    # jittered points
+    jitter = (np.random.rand(len(err)) - 0.5) * 0.08
+    ax.scatter(err, 1 + jitter, s=28, alpha=0.7)
+
+    ax.axvline(0, linestyle="--", linewidth=2)
+    ax.set_yticks([])
+    ax.set_xlabel("LOOCV error (Exp − Pred)")
+    ax.set_title(title)
+
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+def plot_learning_curve(estimator, X_data, y_data, title, base_name):
+    cv = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    sizes, train_scores, val_scores = learning_curve(
+        estimator, X_data, y_data,
+        cv=cv,
+        scoring="neg_root_mean_squared_error",
+        train_sizes=np.linspace(0.2, 1.0, 6),
+        n_jobs=-1
+    )
+    train_rmse = -train_scores.mean(axis=1)
+    val_rmse = -val_scores.mean(axis=1)
+
+    fig = plt.figure(figsize=(7.8, 5.1))
+    ax = plt.gca()
+    ax.plot(sizes, train_rmse, marker="o", label="Training RMSE")
+    ax.plot(sizes, val_rmse, marker="o", label="Validation RMSE")
+    ax.set_xlabel("Training set size")
+    ax.set_ylabel("RMSE")
+    ax.set_title(title)
+    ax.legend()
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+def feature_importance_bar(estimator_pipe, feature_names, title, base_name):
+    """
+    Works for RF / XGB / CatBoost when feature_importances_ exists.
+    """
+    est = estimator_pipe.named_steps["model"]
+    if not hasattr(est, "feature_importances_"):
+        return None
+
+    fi = np.array(est.feature_importances_, dtype=float)
+    order = np.argsort(fi)[::-1]
+    feats = np.array(feature_names)[order]
+    vals = fi[order]
+
+    fig = plt.figure(figsize=(8.4, 5.2))
+    ax = plt.gca()
+    ax.barh(feats[::-1], vals[::-1])
+    ax.set_xlabel("Importance")
+    ax.set_title(title)
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+    return pd.DataFrame({"Feature": feats, "Importance": vals})
+
+def permutation_importance_bar(model, X_test, y_test, feature_names, title, base_name):
+    perm = permutation_importance(model, X_test, y_test, n_repeats=60, random_state=RANDOM_STATE)
+    pi = perm.importances_mean
+    order = np.argsort(pi)[::-1]
+
+    feats = np.array(feature_names)[order]
+    vals = pi[order]
+
+    fig = plt.figure(figsize=(8.4, 5.2))
+    ax = plt.gca()
+    ax.barh(feats[::-1], vals[::-1])
+    ax.set_xlabel("Permutation importance (mean decrease)")
+    ax.set_title(title)
+    plt.tight_layout()
+    _savefig(base_name)
+    plt.close(fig)
+
+    return pd.DataFrame({"Feature": feats, "PermImportance": vals})
+
+def pdp_grid(model, X_all, features, title, base_name):
+    """
+    PDP grid (more academic than one-figure-per-feature).
+    """
+    n = len(features)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+
+    fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=(4.9*ncols, 3.8*nrows))
+    ax = np.array(ax).reshape(-1)
+
+    PartialDependenceDisplay.from_estimator(
+        model, X_all, features,
+        ax=ax[:n],
+        kind="average",
+        grid_resolution=80
+    )
+
+    for k in range(n, len(ax)):
+        ax[k].axis("off")
+
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    # manual save to keep both formats
+    png_path = os.path.join(FIGDIR, f"{base_name}.png")
+    fig.savefig(png_path, bbox_inches="tight", dpi=DPI)
+    if SAVE_PDF:
+        pdf_path = os.path.join(FIGDIR, f"{base_name}.pdf")
+        fig.savefig(pdf_path, bbox_inches="tight", dpi=DPI)
+    print(f"[Saved] {png_path}" + (f" + PDF" if SAVE_PDF else ""))
+    plt.close(fig)
+
+# ----------------------------
+# 5) Load & clean data
+# ----------------------------
+path = find_data_path()
+df = pd.read_excel(path)
+df.columns = [c.strip() for c in df.columns]
+
+if TARGET not in df.columns:
+    raise ValueError(f"Colonne cible '{TARGET}' introuvable. Colonnes trouvées: {list(df.columns)}")
+
+# Convert to numeric where possible
+for c in df.columns:
+    df[c] = pd.to_numeric(df[c], errors="ignore")
+
+X_raw = df.drop(columns=[TARGET]).copy()
+y_raw = pd.to_numeric(df[TARGET], errors="coerce")
+
+# Coerce features to numeric + median imputation
+X = X_raw.copy()
+for c in X.columns:
+    X[c] = pd.to_numeric(X[c], errors="coerce")
+X = X.fillna(X.median(numeric_only=True))
+
+# Drop rows with missing target
+mask = ~y_raw.isna()
+X = X.loc[mask].reset_index(drop=True)
+y = y_raw.loc[mask].reset_index(drop=True)
+
+# Drop duplicates (X + y)
+dup_before = len(X)
+tmp = pd.concat([X, y.rename(TARGET)], axis=1).drop_duplicates()
+X = tmp.drop(columns=[TARGET]).reset_index(drop=True)
+y = tmp[TARGET].reset_index(drop=True)
+dup_after = len(X)
+
+feature_names = X.columns.tolist()
+
+print(f"✅ Data loaded: {path}")
+print(f"✅ Cleaned dataset size: {len(X)} (duplicates removed: {dup_before - dup_after})")
+print("Features:", feature_names)
+print("Target:", TARGET)
+
+# ----------------------------
+# 6) Split 70/30
+# ----------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+)
+
+# ----------------------------
+# 7) Build models (same list as yours)
+# ----------------------------
+models = {}
+
+models["RandomForest"] = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", RandomForestRegressor(random_state=RANDOM_STATE))
+])
+
+models["GBM"] = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", GradientBoostingRegressor(random_state=RANDOM_STATE))
+])
+
+if XGB_AVAILABLE:
+    models["XGBoost"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", XGBRegressor(
+            random_state=RANDOM_STATE,
+            objective="reg:squarederror",
+            n_estimators=300,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            n_jobs=-1
+        ))
+    ])
+
+if CAT_AVAILABLE:
+    models["CatBoost"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", CatBoostRegressor(
+            random_seed=RANDOM_STATE,
+            verbose=False,
+            loss_function="RMSE"
+        ))
+    ])
+
+# ----------------------------
+# 8) Hyperparameter tuning grids (unchanged spirit)
+# ----------------------------
+cv5 = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+param_grids = {
+    "RandomForest": {
+        "model__n_estimators": [300, 600, 900],
+        "model__max_depth": [None, 6, 10, 14],
+        "model__min_samples_split": [2, 4, 6],
+        "model__min_samples_leaf": [1, 2, 3],
+        "model__max_features": ["sqrt", 0.8, 1.0],
+    },
+    "GBM": {
+        "model__n_estimators": [200, 400, 800],
+        "model__learning_rate": [0.03, 0.05, 0.1],
+        "model__max_depth": [2, 3, 4],
+        "model__subsample": [0.8, 0.9, 1.0],
+    }
+}
+
+if XGB_AVAILABLE:
+    param_grids["XGBoost"] = {
+        "model__n_estimators": [150, 300, 600],
+        "model__max_depth": [3, 4, 5, 6],
+        "model__learning_rate": [0.03, 0.05, 0.1],
+        "model__subsample": [0.8, 0.9, 1.0],
+        "model__colsample_bytree": [0.8, 0.9, 1.0]
+    }
+
+if CAT_AVAILABLE:
+    param_grids["CatBoost"] = {
+        "model__iterations": [400, 800, 1200],
+        "model__depth": [4, 6, 8],
+        "model__learning_rate": [0.03, 0.05, 0.1],
+        "model__l2_leaf_reg": [1, 3, 5, 7]
+    }
+
+# ----------------------------
+# 9) Run Default + Tuned, save formatted tables
+# ----------------------------
+default_rows, tuned_rows = [], []
+best_estimators = {}
+
+for name, pipe in models.items():
+    # Default
+    pipe.fit(X_train, y_train)
+    pred = pipe.predict(X_test)
+    m = metrics(y_test, pred)
+    default_rows.append({"Model": name, **m})
+
+    # Tuned
+    gs = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grids[name],
+        scoring="r2",
+        cv=cv5,
+        n_jobs=-1
+    )
+    gs.fit(X_train, y_train)
+    best_estimators[name] = gs.best_estimator_
+
+    pred_best = gs.best_estimator_.predict(X_test)
+    m_best = metrics(y_test, pred_best)
+    tuned_rows.append({"Model": name, **m_best, "BestParams": str(gs.best_params_)})
+
+df_default = pd.DataFrame(default_rows).sort_values("R2", ascending=False).reset_index(drop=True)
+df_tuned = pd.DataFrame(tuned_rows).sort_values("R2", ascending=False).reset_index(drop=True)
+
+save_excel_formatted(df_default, "Table_Default_Performance.xlsx", float_cols=["R2", "RMSE", "MSE", "MAE"])
+save_excel_formatted(df_tuned, "Table_Tuned_Performance.xlsx", float_cols=["R2", "RMSE", "MSE", "MAE"])
+
+print("\n✅ Saved tables (formatted):")
+print(" - tables/Table_Default_Performance.xlsx")
+print(" - tables/Table_Tuned_Performance.xlsx")
+
+# Best tuned model
+best_model_name = df_tuned.iloc[0]["Model"]
+best_model = best_estimators[best_model_name]
+print(f"\n🏆 Best tuned model = {best_model_name}")
+
+# ----------------------------
+# 10) Professional comparison plots: Default vs Tuned
+# ----------------------------
+bar_compare_default_tuned(df_default, df_tuned, "R2",
+                         "Model comparison (Test set) — R² (Default vs Tuned)",
+                         "Compare_R2_Default_vs_Tuned")
+
+bar_compare_default_tuned(df_default, df_tuned, "RMSE",
+                         "Model comparison (Test set) — RMSE (Default vs Tuned)",
+                         "Compare_RMSE_Default_vs_Tuned")
+
+bar_compare_default_tuned(df_default, df_tuned, "MAE",
+                         "Model comparison (Test set) — MAE (Default vs Tuned)",
+                         "Compare_MAE_Default_vs_Tuned")
+
+# ----------------------------
+# 11) Parity + Residuals (Tuned)
+# ----------------------------
+for name, mdl in best_estimators.items():
+    mdl.fit(X_train, y_train)
+    p_tr = mdl.predict(X_train)
+    p_te = mdl.predict(X_test)
+
+    parity_plot_train_test(
+        y_train, p_tr, y_test, p_te,
+        title=f"{name} (Tuned) — Parity plot (Train/Test)",
+        base_name=f"Parity_{name}_Tuned"
+    )
+
+    residual_plot(
+        y_test, p_te,
+        title=f"{name} (Tuned) — Residual plot (Test)",
+        base_name=f"Residual_{name}_Tuned"
+    )
+
+# ----------------------------
+# 12) K-fold CV (R2) on full dataset + table
+# ----------------------------
+cv = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+cv_rows = []
+for name, mdl in best_estimators.items():
+    scores = cross_val_score(mdl, X, y, cv=cv, scoring="r2", n_jobs=-1)
+    cv_rows.append({
+        "Model": name,
+        "KFold_R2_mean": float(scores.mean()),
+        "KFold_R2_std": float(scores.std())
+    })
+df_kfold = pd.DataFrame(cv_rows).sort_values("KFold_R2_mean", ascending=False).reset_index(drop=True)
+save_excel_formatted(df_kfold, "Table_KFold_R2.xlsx", float_cols=["KFold_R2_mean", "KFold_R2_std"])
+
+# ----------------------------
+# 13) LOOCV: parity + error distribution + summary table
+# ----------------------------
+loocv_rows = []
+for name, mdl in best_estimators.items():
+    y_cv = loocv_parity_plot(
+        mdl, X, y,
+        title=f"{name} — LOOCV parity plot",
+        base_name=f"LOOCV_Parity_{name}"
+    )
+    loocv_error_distribution(
+        y, y_cv,
+        title=f"{name} — LOOCV error distribution",
+        base_name=f"LOOCV_ErrorDist_{name}"
+    )
+
+    err = (y.values - y_cv)
+    loocv_rows.append({
+        "Model": name,
+        "LOOCV_R2": float(r2_score(y, y_cv)),
+        "LOOCV_RMSE": float(np.sqrt(mean_squared_error(y, y_cv))),
+        "LOOCV_MAE": float(mean_absolute_error(y, y_cv)),
+        "LOOCV_Error_mean": float(np.mean(err)),
+        "LOOCV_Error_std": float(np.std(err))
+    })
+
+df_loocv = pd.DataFrame(loocv_rows).sort_values("LOOCV_RMSE", ascending=True).reset_index(drop=True)
+save_excel_formatted(df_loocv, "Table_LOOCV_Summary.xlsx",
+                     float_cols=["LOOCV_R2","LOOCV_RMSE","LOOCV_MAE","LOOCV_Error_mean","LOOCV_Error_std"])
+
+# ----------------------------
+# 14) Learning curves (RMSE)
+# ----------------------------
+for name, mdl in best_estimators.items():
+    plot_learning_curve(
+        mdl, X, y,
+        title=f"{name} — Learning curve (RMSE)",
+        base_name=f"LearningCurve_{name}"
+    )
+
+# ----------------------------
+# 15) Interpretations for BEST model
+# ----------------------------
+best_model.fit(X_train, y_train)
+est = best_model.named_steps["model"]
+
+# Feature importance (if available)
+df_fi = feature_importance_bar(
+    best_model, feature_names,
+    title=f"{best_model_name} — Feature importance",
+    base_name="FeatureImportance_BestModel"
+)
+if df_fi is not None:
+    save_excel_formatted(df_fi, "Table_FeatureImportance.xlsx", float_cols=["Importance"])
+
+# Permutation importance (model-agnostic)
+df_pi = permutation_importance_bar(
+    best_model, X_test, y_test, feature_names,
+    title=f"{best_model_name} — Permutation importance (test set)",
+    base_name="PermutationImportance_BestModel"
+)
+save_excel_formatted(df_pi, "Table_PermutationImportance.xlsx", float_cols=["PermImportance"])
+
+# SHAP (if available)
+if SHAP_AVAILABLE:
+    try:
+        scaler = best_model.named_steps["scaler"]
+        Xtr_s = scaler.transform(X_train)
+
+        # TreeExplainer for tree-like models
+        explainer = shap.TreeExplainer(est)
+        shap_values = explainer.shap_values(Xtr_s)
+
+        # Summary
+        plt.figure(figsize=(9.2, 5.4))
+        shap.summary_plot(shap_values, Xtr_s, feature_names=feature_names, show=False)
+        plt.title(f"{best_model_name} — SHAP summary (train)")
+        plt.tight_layout()
+        _savefig("SHAP_Summary_BestModel")
+        plt.close()
+
+        # Bar
+        plt.figure(figsize=(9.2, 5.4))
+        shap.summary_plot(shap_values, Xtr_s, feature_names=feature_names, plot_type="bar", show=False)
+        plt.title(f"{best_model_name} — Mean |SHAP| (train)")
+        plt.tight_layout()
+        _savefig("SHAP_Bar_BestModel")
+        plt.close()
+
+    except Exception as e:
+        print("⚠️ SHAP skipped:", e)
+
+# PDP grid for all features (clean multi-panel)
+pdp_grid(
+    best_model, X, feature_names,
+    title=f"{best_model_name} — Partial Dependence Plots (PDP)",
+    base_name="PDP_Grid_BestModel"
+)
+
+print("\n✅ ALL DONE. Everything saved in:", OUTDIR)
+print("Tables in:", TABDIR)
+print("Figures in:", FIGDIR)
